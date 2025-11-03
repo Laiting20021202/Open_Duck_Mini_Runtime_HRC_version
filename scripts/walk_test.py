@@ -1,0 +1,605 @@
+#!/usr/bin/env python3
+import time
+import pickle
+import os
+import sys
+import tty
+import termios
+import select
+import threading
+
+import numpy as np
+from mini_bdx_runtime.rustypot_position_hwi import HWI
+from mini_bdx_runtime.onnx_infer import OnnxInfer
+from mini_bdx_runtime.raw_imu import Imu
+from mini_bdx_runtime.poly_reference_motion import PolyReferenceMotion
+# from mini_bdx_runtime.xbox_controller import XBoxController  # <-- removed
+from mini_bdx_runtime.feet_contacts import FeetContacts
+from mini_bdx_runtime.eyes import Eyes
+from mini_bdx_runtime.sounds import Sounds
+from mini_bdx_runtime.antennas import Antennas
+from mini_bdx_runtime.projector import Projector
+from mini_bdx_runtime.rl_utils import make_action_dict, LowPassActionFilter
+from mini_bdx_runtime.duck_config import DuckConfig
+
+HOME_DIR = os.path.expanduser("~")
+
+# ---------------------------
+# Minimal button state helper
+# ---------------------------
+class _Edge:
+    def __init__(self):
+        self.is_pressed = False
+        self._prev = False
+        self.triggered = False
+
+    def set(self, v: bool):
+        self.triggered = (not self.is_pressed) and v
+        self._prev = self.is_pressed
+        self.is_pressed = v
+
+class _Buttons:
+    def __init__(self):
+        # Map to original names used in code
+        self.dpad_up = _Edge()
+        self.dpad_down = _Edge()
+        self.LB = _Edge()
+        self.X = _Edge()
+        self.B = _Edge()
+        self.A = _Edge()
+
+    def clear_triggers(self):
+        # After a read, clear rising-edges (we keep is_pressed)
+        for b in [self.dpad_up, self.dpad_down, self.LB, self.X, self.B, self.A]:
+            b.triggered = False
+
+# --------------------------------
+# Keyboard Controller (no deps)
+# --------------------------------
+class KeyboardController:
+    """
+    Emulates XBoxController.get_last_command() using keyboard.
+    - Returns (last_commands[7], buttons, left_trigger, right_trigger)
+    last_commands = [x, y, yaw, head_0, head_1, head_2, head_3]
+    Triggers are in [0..1].
+    """
+    def __init__(self, command_hz=20.0):
+        self.dt = 1.0 / command_hz
+        self.lock = threading.Lock()
+
+        # command vector
+        self.cmd = np.zeros(7, dtype=float)
+        self.left_trigger = 0.0
+        self.right_trigger = 0.0
+        self.buttons = _Buttons()
+
+        # internal key states
+        self._keys = set()
+
+        # rates/limits
+        self.lin_step = 0.02     # per tick increment for W/A/S/D
+        self.yaw_step = 0.02     # Q/E
+        self.head_step = 0.01    # H/J/K/L
+        self.trigger_step = 0.04 # U/O 0..1
+        self.max_lin = 0.3
+        self.max_yaw = 0.6
+        self.max_head = 0.3
+
+        # terminal raw mode setup
+        self._orig_term_attr = termios.tcgetattr(sys.stdin.fileno())
+        tty.setcbreak(sys.stdin.fileno())
+        self._stop = False
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+
+    def _read_loop(self):
+        try:
+            while not self._stop:
+                r, _, _ = select.select([sys.stdin], [], [], 0.01)
+                if r:
+                    ch = os.read(sys.stdin.fileno(), 1)
+                    if not ch:
+                        continue
+                    c = ch.decode(errors="ignore")
+                    with self.lock:
+                        self._handle_char(c)
+                else:
+                    time.sleep(0.005)
+        except Exception:
+            pass
+
+    def _handle_char(self, c: str):
+        # Toggle/press events
+        # Rising-edge (triggered) ones: X/B/P/[ and ]
+        if c.lower() == 'x':
+            self.buttons.X.set(True); self.buttons.X.triggered = True; self.buttons.X.set(False)
+        elif c.lower() == 'b':
+            self.buttons.B.set(True); self.buttons.B.triggered = True; self.buttons.B.set(False)
+        elif c.lower() == 'p':
+            self.buttons.A.set(True); self.buttons.A.triggered = True; self.buttons.A.set(False)
+        elif c == '[':
+            self.buttons.dpad_down.set(True); self.buttons.dpad_down.triggered = True; self.buttons.dpad_down.set(False)
+        elif c == ']':
+            self.buttons.dpad_up.set(True); self.buttons.dpad_up.triggered = True; self.buttons.dpad_up.set(False)
+        elif c == ';':
+            # hold as LB
+            self.buttons.LB.set(True)
+        elif c == '\n' or c == '\r':
+            pass
+        elif c.lower() == 'z':
+            # zero all
+            self.cmd[:] = 0.0
+            self.left_trigger = 0.0
+            self.right_trigger = 0.0
+        else:
+            # For continuous controls, we keep a small pressed set
+            self._keys.add(c)
+
+        # Key release is handled by a timeout decay below (no raw keyup in basic stdin)
+
+    def _decay_axis(self, val, step):
+        if val > 0:
+            val = max(0.0, val - step)
+        elif val < 0:
+            val = min(0.0, val + step)
+        return val
+
+    def _clamp(self, v, lo, hi):
+        return max(lo, min(hi, v))
+
+    def get_last_command(self):
+        # integrate keys into cmd at fixed-rate
+        with self.lock:
+            # hold LB only if ';' seen recently; emulate "momentary" by clearing every call unless still receiving ';'"
+            lb_pressed = self.buttons.LB.is_pressed
+            self.buttons.LB.set(False)  # will be set again on next ';' press if user keeps hitting
+
+            # Linear XY (WASD)
+            if 'w' in self._keys or 'W' in self._keys:
+                self.cmd[0] = self._clamp(self.cmd[0] + self.lin_step, -self.max_lin, self.max_lin)
+            elif 's' in self._keys or 'S' in self._keys:
+                self.cmd[0] = self._clamp(self.cmd[0] - self.lin_step, -self.max_lin, self.max_lin)
+            else:
+                self.cmd[0] = self._decay_axis(self.cmd[0], self.lin_step)
+
+            if 'd' in self._keys or 'D' in self._keys:
+                self.cmd[1] = self._clamp(self.cmd[1] + self.lin_step, -self.max_lin, self.max_lin)
+            elif 'a' in self._keys or 'A' in self._keys:
+                self.cmd[1] = self._clamp(self.cmd[1] - self.lin_step, -self.max_lin, self.max_lin)
+            else:
+                self.cmd[1] = self._decay_axis(self.cmd[1], self.lin_step)
+
+            # Yaw (Q/E)
+            if 'e' in self._keys or 'E' in self._keys:
+                self.cmd[2] = self._clamp(self.cmd[2] + self.yaw_step, -self.max_yaw, self.max_yaw)
+            elif 'q' in self._keys or 'Q' in self._keys:
+                self.cmd[2] = self._clamp(self.cmd[2] - self.yaw_step, -self.max_yaw, self.max_yaw)
+            else:
+                self.cmd[2] = self._decay_axis(self.cmd[2], self.yaw_step)
+
+            # Head joints (H/J/K/L)
+            if 'h' in self._keys or 'H' in self._keys:
+                self.cmd[3] = self._clamp(self.cmd[3] + self.head_step, -self.max_head, self.max_head)
+            elif 'j' in self._keys or 'J' in self._keys:
+                self.cmd[4] = self._clamp(self.cmd[4] + self.head_step, -self.max_head, self.max_head)
+            elif 'k' in self._keys or 'K' in self._keys:
+                self.cmd[5] = self._clamp(self.cmd[5] + self.head_step, -self.max_head, self.max_head)
+            elif 'l' in self._keys or 'L' in self._keys:
+                self.cmd[6] = self._clamp(self.cmd[6] + self.head_step, -self.max_head, self.max_head)
+            else:
+                # light decay to center head offsets
+                for i in range(3, 7):
+                    self.cmd[i] = self._decay_axis(self.cmd[i], self.head_step*0.5)
+
+            # Triggers (U/O) -> antennas position 0..1
+            if 'u' in self._keys or 'U' in self._keys:
+                self.left_trigger = self._clamp(self.left_trigger + self.trigger_step, 0.0, 1.0)
+            else:
+                self.left_trigger = self._clamp(self.left_trigger - self.trigger_step*0.5, 0.0, 1.0)
+
+            if 'o' in self._keys or 'O' in self._keys:
+                self.right_trigger = self._clamp(self.right_trigger + self.trigger_step, 0.0, 1.0)
+            else:
+                self.right_trigger = self._clamp(self.right_trigger - self.trigger_step*0.5, 0.0, 1.0)
+
+            # LB hold state re-applied (we cleared above to emulate "momentary" unless hitting ';' repeatedly)
+            if lb_pressed:
+                self.buttons.LB.set(True)
+
+            # clear pressed keys buffer each cycle (simple, robust)
+            self._keys.clear()
+
+            # Return values similar to XBoxController
+            return self.cmd.copy(), self.buttons, self.left_trigger, self.right_trigger
+
+    def close(self):
+        self._stop = True
+        try:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._orig_term_attr)
+        except Exception:
+            pass
+
+
+def _resolve_port_baud(duck_cfg: DuckConfig, fallback_port: str | None):
+    # 1) env 覆蓋  2) 參數  3) config  4) default
+    port = os.environ.get("HWI_PORT") or fallback_port
+    if not port:
+        port = getattr(duck_cfg, "serial_port", None)
+    if not port:
+        port = "/dev/ttyACM0"
+
+    baud_env = os.environ.get("HWI_BAUD")
+    if baud_env is not None:
+        try:
+            baud = int(baud_env)
+        except Exception:
+            baud = 1000000
+    else:
+        baud = getattr(duck_cfg, "baudrate", 1000000)
+
+    return port, int(baud)
+
+
+class RLWalk:
+    def __init__(
+        self,
+        onnx_model_path: str,
+        duck_config_path: str = f"{HOME_DIR}/duck_config.json",
+        serial_port: str = "/dev/ttyACM0",
+        control_freq: float = 50,
+        pid=[30, 0, 0],
+        action_scale=0.25,
+        commands=False,
+        pitch_bias=0,
+        save_obs=False,
+        replay_obs=None,
+        cutoff_frequency=None,
+    ):
+        self.duck_config = DuckConfig(config_json_path=duck_config_path)
+
+        self.commands = commands
+        self.pitch_bias = pitch_bias
+
+        self.onnx_model_path = onnx_model_path
+        self.policy = OnnxInfer(self.onnx_model_path, awd=True)
+
+        self.num_dofs = 14
+        self.max_motor_velocity = 5.24  # rad/s
+
+        # Control
+        self.control_freq = control_freq
+        self.pid = pid
+
+        self.save_obs = save_obs
+        if self.save_obs:
+            self.saved_obs = []
+
+        self.replay_obs = replay_obs
+        if self.replay_obs is not None:
+            self.replay_obs = pickle.load(open(self.replay_obs, "rb"))
+
+        self.action_filter = None
+        if cutoff_frequency is not None:
+            self.action_filter = LowPassActionFilter(
+                self.control_freq, cutoff_frequency
+            )
+
+        # ---- HWI（穩健的序列埠/鮑率取得）----
+        port, baud = _resolve_port_baud(self.duck_config, serial_port)
+        # HWI 內部會使用 duck_config 的鮑率；這裡僅做提示
+        print(f"[HWI] using {port} @ {baud}")
+        self.hwi = HWI(self.duck_config, port)
+
+        self.start()
+
+        self.imu = Imu(
+            sampling_freq=int(self.control_freq),
+            user_pitch_bias=self.pitch_bias,
+            upside_down=self.duck_config.imu_upside_down,
+        )
+
+        self.feet_contacts = FeetContacts()
+
+        # Scales
+        self.action_scale = action_scale
+
+        self.last_action = np.zeros(self.num_dofs)
+        self.last_last_action = np.zeros(self.num_dofs)
+        self.last_last_last_action = np.zeros(self.num_dofs)
+
+        self.init_pos = list(self.hwi.init_pos.values())
+
+        self.motor_targets = np.array(self.init_pos.copy())
+        self.prev_motor_targets = np.array(self.init_pos.copy())
+
+        self.last_commands = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+        self.paused = self.duck_config.start_paused
+
+        self.command_freq = 20  # hz
+        if self.commands:
+            # self.xbox_controller = XBoxController(self.command_freq)
+            self.keyboard = KeyboardController(self.command_freq)
+
+        # Reference motion, but we only really need the length of one phase
+        self.PRM = PolyReferenceMotion("./polynomial_coefficients.pkl")
+        self.imitation_i = 0
+        self.imitation_phase = np.array([0, 0])
+        self.phase_frequency_factor = 1.0
+        self.phase_frequency_factor_offset = (
+            self.duck_config.phase_frequency_factor_offset
+        )
+
+        # Optional expression features
+        if self.duck_config.eyes:
+            self.eyes = Eyes()
+        if self.duck_config.projector:
+            self.projector = Projector()
+        if self.duck_config.speaker:
+            self.sounds = Sounds(
+                volume=1.0, sound_directory="../mini_bdx_runtime/assets/"
+            )
+        if self.duck_config.antennas:
+            self.antennas = Antennas()
+
+    def get_obs(self):
+        imu_data = self.imu.get_data()
+
+        dof_pos = self.hwi.get_present_positions(
+            ignore=[
+                "left_antenna",
+                "right_antenna",
+            ]
+        )  # rad
+
+        dof_vel = self.hwi.get_present_velocities(
+            ignore=[
+                "left_antenna",
+                "right_antenna",
+            ]
+        )  # rad/s
+
+        if dof_pos is None or dof_vel is None:
+            return None
+
+        if len(dof_pos) != self.num_dofs:
+            print(f"ERROR len(dof_pos) != {self.num_dofs}")
+            return None
+
+        if len(dof_vel) != self.num_dofs:
+            print(f"ERROR len(dof_vel) != {self.num_dofs}")
+            return None
+
+        cmds = self.last_commands
+        feet_contacts = self.feet_contacts.get()
+
+        obs = np.concatenate(
+            [
+                imu_data["gyro"],
+                imu_data["accelero"],
+                cmds,
+                dof_pos - self.init_pos,
+                dof_vel * 0.05,
+                self.last_action,
+                self.last_last_action,
+                self.last_last_last_action,
+                self.motor_targets,
+                feet_contacts,
+                self.imitation_phase,
+            ]
+        )
+        return obs
+
+    def start(self):
+        kps = [self.pid[0]] * 14
+        kds = [self.pid[2]] * 14
+
+        # lower head kps
+        kps[5:9] = [8, 8, 8, 8]
+
+        self.hwi.set_kps(kps)
+        self.hwi.set_kds(kds)
+        self.hwi.turn_on()
+
+        time.sleep(2)
+
+    def get_phase_frequency_factor(self, x_velocity):
+        max_phase_frequency = 1.2
+        min_phase_frequency = 1.0
+        freq = min_phase_frequency + (abs(x_velocity) / 0.15) * (
+            max_phase_frequency - min_phase_frequency
+        )
+        return freq
+
+    def run(self):
+        i = 0
+        kb = getattr(self, "keyboard", None)
+        try:
+            print("Starting (Keyboard control active)" if kb else "Starting")
+            start_t = time.time()
+            while True:
+                left_trigger = 0
+                right_trigger = 0
+                t = time.time()
+
+                if self.commands and kb is not None:
+                    self.last_commands, self.buttons, left_trigger, right_trigger = kb.get_last_command()
+
+                    if self.buttons.dpad_up.triggered:
+                        self.phase_frequency_factor_offset += 0.05
+                        print(f"Phase frequency factor offset {round(self.phase_frequency_factor_offset, 3)}")
+
+                    if self.buttons.dpad_down.triggered:
+                        self.phase_frequency_factor_offset -= 0.05
+                        print(f"Phase frequency factor offset {round(self.phase_frequency_factor_offset, 3)}")
+
+                    if self.buttons.LB.is_pressed:
+                        self.phase_frequency_factor = 1.3
+                    else:
+                        self.phase_frequency_factor = 1.0
+
+                    if self.buttons.X.triggered and self.duck_config.projector:
+                        self.projector.switch()
+
+                    if self.buttons.B.triggered and self.duck_config.speaker:
+                        self.sounds.play_random_sound()
+
+                    if self.duck_config.antennas:
+                        self.antennas.set_position_left(right_trigger)
+                        self.antennas.set_position_right(left_trigger)
+
+                    if self.buttons.A.triggered:
+                        self.paused = not self.paused
+                        print("PAUSE" if self.paused else "UNPAUSE")
+
+                    # clear edge triggers after consumption
+                    self.buttons.clear_triggers()
+
+                if self.paused:
+                    time.sleep(0.1)
+                    continue
+
+                obs = self.get_obs()
+                if obs is None:
+                    continue
+
+                self.imitation_i += 1 * (
+                    self.phase_frequency_factor + self.phase_frequency_factor_offset
+                )
+                self.imitation_i = self.imitation_i % self.PRM.nb_steps_in_period
+                self.imitation_phase = np.array(
+                    [
+                        np.cos(
+                            self.imitation_i / self.PRM.nb_steps_in_period * 2 * np.pi
+                        ),
+                        np.sin(
+                            self.imitation_i / self.PRM.nb_steps_in_period * 2 * np.pi
+                        ),
+                    ]
+                )
+
+                if self.save_obs:
+                    self.saved_obs.append(obs)
+
+                if self.replay_obs is not None:
+                    if i < len(self.replay_obs):
+                        obs = self.replay_obs[i]
+                    else:
+                        print("BREAKING ")
+                        break
+
+                action = self.policy.infer(obs)
+
+                self.last_last_last_action = self.last_last_action.copy()
+                self.last_last_action = self.last_action.copy()
+                self.last_action = action.copy()
+
+                self.motor_targets = self.init_pos + action * self.action_scale
+
+                if self.action_filter is not None:
+                    self.action_filter.push(self.motor_targets)
+                    filtered_motor_targets = self.action_filter.get_filtered_action()
+                    if (time.time() - start_t > 1):  # give time to the filter to stabilize
+                        self.motor_targets = filtered_motor_targets
+
+                self.prev_motor_targets = self.motor_targets.copy()
+
+                # head offsets: add last_commands[3:7] to joints 5..8
+                head_motor_targets = self.last_commands[3:] + self.motor_targets[5:9]
+                self.motor_targets[5:9] = head_motor_targets
+
+                action_dict = make_action_dict(
+                    self.motor_targets, list(self.hwi.joints.keys())
+                )
+                self.hwi.set_position_all(action_dict)
+
+                i += 1
+
+                took = time.time() - t
+                if (1 / self.control_freq - took) < 0:
+                    print(
+                        "Policy control budget exceeded by",
+                        np.around(took - 1 / self.control_freq, 3),
+                    )
+                time.sleep(max(0, 1 / self.control_freq - took))
+
+        except KeyboardInterrupt:
+            print("\nKeyboardInterrupt received. Stopping...")
+        finally:
+            if getattr(self, "keyboard", None):
+                self.keyboard.close()
+            if self.duck_config.antennas:
+                self.antennas.stop()
+            if self.duck_config.eyes:
+                self.eyes.stop()
+            if self.duck_config.projector:
+                self.projector.stop()
+            self.feet_contacts.stop()
+
+        if self.save_obs:
+            pickle.dump(self.saved_obs, open("robot_saved_obs.pkl", "wb"))
+        print("TURNING OFF")
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--onnx_model_path",
+        type=str,
+        required=False,
+        default="/home/bdxv2/Open_Duck_Mini/BEST_WALK_ONNX_2.onnx",
+    )
+    parser.add_argument(
+        "--duck_config_path",
+        type=str,
+        required=False,
+        default=f"{HOME_DIR}/duck_config.json",
+    )
+    parser.add_argument("-a", "--action_scale", type=float, default=0.25)
+    parser.add_argument("-p", type=int, default=30)
+    parser.add_argument("-i", type=int, default=0)
+    parser.add_argument("-d", type=int, default=0)
+    parser.add_argument("-c", "--control_freq", type=int, default=50)
+    parser.add_argument("--pitch_bias", type=float, default=0, help="deg")
+    parser.add_argument(
+        "--commands",
+        action="store_true",
+        default=True,
+        help="external commands (keyboard).",
+    )
+    parser.add_argument(
+        "--save_obs",
+        type=str,
+        required=False,
+        default=False,
+        help="save the run's observations",
+    )
+    parser.add_argument(
+        "--replay_obs",
+        type=str,
+        required=False,
+        default=None,
+        help="replay the observations from a previous run",
+    )
+    parser.add_argument("--cutoff_frequency", type=float, default=None)
+
+    args = parser.parse_args()
+    pid = [args.p, args.i, args.d]
+
+    print("Done parsing args")
+    rl_walk = RLWalk(
+        args.onnx_model_path,
+        duck_config_path=args.duck_config_path,
+        action_scale=args.action_scale,
+        pid=pid,
+        control_freq=args.control_freq,
+        commands=args.commands,
+        pitch_bias=args.pitch_bias,
+        save_obs=args.save_obs,
+        replay_obs=args.replay_obs,
+        cutoff_frequency=args.cutoff_frequency,
+    )
+    print("Done instantiating RLWalk")
+    rl_walk.run()

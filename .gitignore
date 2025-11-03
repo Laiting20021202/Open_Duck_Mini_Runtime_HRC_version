@@ -1,4 +1,42 @@
+# Python
 __pycache__/
-mini_bdx_runtime.egg-info/
-build
-dist
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+.venv/
+venv/
+ENV/
+*.log
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ROS/records
+*.db3
+*.bag
+*.bag.active
+*.mcap
+
+# Models and big binaries (建議放外部路徑或用 LFS)
+*.onnx
+*.pth
+*.pt
+*.pkl
+*.npz
+*.npy
+
+# Build / cache
+build/
+dist/
+.cache/
+.mypy_cache/
+pytest_cache/
+
+# Local config/secrets（如要版本控制，改成樣板 *.example）
+*.local.json
+*.secret.json

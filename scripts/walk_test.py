@@ -249,11 +249,16 @@ class RLWalk:
         control_freq: float = 50,
         pid=[30, 0, 0],
         action_scale=0.25,
+        leg_action_multiplier: float = 1.0,
         commands=False,
         pitch_bias=0,
+        hip_pitch_trim_deg: float = 0.0,
         save_obs=False,
         replay_obs=None,
         cutoff_frequency=None,
+        imu_auto_tare=True,
+        imu_tare_window=120,
+        imu_tare_std_threshold=0.05,
     ):
         self.duck_config = DuckConfig(config_json_path=duck_config_path)
 
@@ -290,18 +295,25 @@ class RLWalk:
         print(f"[HWI] using {port} @ {baud}")
         self.hwi = HWI(self.duck_config, port)
 
+        self.hip_pitch_trim = np.deg2rad(hip_pitch_trim_deg)
+        if self.hip_pitch_trim != 0.0:
+            self._apply_hip_pitch_trim()
+
         self.start()
 
         self.imu = Imu(
             sampling_freq=int(self.control_freq),
             user_pitch_bias=self.pitch_bias,
             upside_down=self.duck_config.imu_upside_down,
+            auto_tare=imu_auto_tare,
+            tare_window=imu_tare_window,
+            tare_std_threshold=imu_tare_std_threshold,
         )
 
         self.feet_contacts = FeetContacts()
 
         # Scales
-        self.action_scale = action_scale
+        self.action_scale = self._make_action_scale(action_scale, leg_action_multiplier)
 
         self.last_action = np.zeros(self.num_dofs)
         self.last_last_action = np.zeros(self.num_dofs)
@@ -541,6 +553,41 @@ class RLWalk:
         print("TURNING OFF")
 
 
+    def _apply_hip_pitch_trim(self):
+        left = self.hwi.init_pos.get("left_hip_pitch")
+        right = self.hwi.init_pos.get("right_hip_pitch")
+
+        if left is not None:
+            left_sign = -1.0 if left < 0 else 1.0
+            self.hwi.init_pos["left_hip_pitch"] = left + self.hip_pitch_trim * left_sign
+
+        if right is not None:
+            right_sign = -1.0 if right < 0 else 1.0
+            self.hwi.init_pos["right_hip_pitch"] = right + self.hip_pitch_trim * right_sign
+
+        print(
+            "[Posture] Applied hip pitch trim:",
+            np.degrees(self.hip_pitch_trim),
+            "deg (sign-aware)",
+        )
+
+    def _make_action_scale(self, action_scale, leg_multiplier):
+        if np.isscalar(action_scale):
+            scale = np.full(self.num_dofs, float(action_scale), dtype=float)
+        else:
+            scale = np.array(action_scale, dtype=float)
+            if scale.size != self.num_dofs:
+                raise ValueError(
+                    "action_scale array must have length equal to number of dofs"
+                )
+
+        leg_indices = [2, 3, 4, 11, 12, 13]
+        if leg_multiplier is not None and leg_multiplier != 1.0:
+            scale[leg_indices] *= float(leg_multiplier)
+
+        return scale
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -564,6 +611,18 @@ if __name__ == "__main__":
     parser.add_argument("-c", "--control_freq", type=int, default=50)
     parser.add_argument("--pitch_bias", type=float, default=0, help="deg")
     parser.add_argument(
+        "--leg_action_multiplier",
+        type=float,
+        default=1.0,
+        help="Extra multiplier applied to hip pitch/knee/ankle actions.",
+    )
+    parser.add_argument(
+        "--hip_pitch_trim_deg",
+        type=float,
+        default=0.0,
+        help="Static trim (deg) applied to hip pitch initial pose to counter lean.",
+    )
+    parser.add_argument(
         "--commands",
         action="store_true",
         default=True,
@@ -584,6 +643,23 @@ if __name__ == "__main__":
         help="replay the observations from a previous run",
     )
     parser.add_argument("--cutoff_frequency", type=float, default=None)
+    parser.add_argument(
+        "--disable_imu_auto_tare",
+        action="store_true",
+        help="Skip automatic accelerometer X-axis tare calibration.",
+    )
+    parser.add_argument(
+        "--imu_tare_window",
+        type=int,
+        default=120,
+        help="Samples used when computing the IMU accelerometer offset.",
+    )
+    parser.add_argument(
+        "--imu_tare_std_threshold",
+        type=float,
+        default=0.05,
+        help="Std-dev threshold (m/s^2) for accepting IMU tare measurements.",
+    )
 
     args = parser.parse_args()
     pid = [args.p, args.i, args.d]
@@ -593,13 +669,18 @@ if __name__ == "__main__":
         args.onnx_model_path,
         duck_config_path=args.duck_config_path,
         action_scale=args.action_scale,
+        leg_action_multiplier=args.leg_action_multiplier,
         pid=pid,
         control_freq=args.control_freq,
         commands=args.commands,
         pitch_bias=args.pitch_bias,
+        hip_pitch_trim_deg=args.hip_pitch_trim_deg,
         save_obs=args.save_obs,
         replay_obs=args.replay_obs,
         cutoff_frequency=args.cutoff_frequency,
+        imu_auto_tare=not args.disable_imu_auto_tare,
+        imu_tare_window=args.imu_tare_window,
+        imu_tare_std_threshold=args.imu_tare_std_threshold,
     )
     print("Done instantiating RLWalk")
     rl_walk.run()

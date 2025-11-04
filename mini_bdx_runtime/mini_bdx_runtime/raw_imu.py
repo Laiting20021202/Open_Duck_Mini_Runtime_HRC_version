@@ -13,10 +13,20 @@ import time
 # TODO filter spikes
 class Imu:
     def __init__(
-        self, sampling_freq, user_pitch_bias=0, calibrate=False, upside_down=True
+        self,
+        sampling_freq,
+        user_pitch_bias=0,
+        calibrate=False,
+        upside_down=True,
+        auto_tare=True,
+        tare_window=120,
+        tare_std_threshold=0.05,
     ):
         self.sampling_freq = sampling_freq
         self.calibrate = calibrate
+        self.auto_tare = auto_tare
+        self.tare_window = tare_window
+        self.tare_std_threshold = tare_std_threshold
 
         i2c = busio.I2C(board.SCL, board.SDA)
         self.imu = adafruit_bno055.BNO055_I2C(i2c)
@@ -86,9 +96,10 @@ class Imu:
             print("imu_calib_data.pkl not found")
             print("Imu is running uncalibrated")
 
-        self.x_offset = 0
+        self.x_offset = 0.0
 
-        # self.tare_x()
+        if self.auto_tare:
+            self.tare_x()
 
         self.last_imu_data = [0, 0, 0, 0]
         self.last_imu_data = {
@@ -99,42 +110,64 @@ class Imu:
         Thread(target=self.imu_worker, daemon=True).start()
 
     def tare_x(self):
-        print("Taring x ...")
+        print("Taring x ... (keep the robot still)")
         x_values = []
-        num_values = 100
-        ok = False
-        while not ok:
-            x_values.append(np.array(self.imu.acceleration)[0])
+        attempts = 0
+        max_attempts = max(self.tare_window * 20, 200)
+        while attempts < max_attempts:
+            raw_accel = self.imu.acceleration
+            if not self._tuple_valid(raw_accel):
+                attempts += 1
+                time.sleep(0.01)
+                continue
 
-            x_values = x_values[-num_values:]
+            x_values.append(float(raw_accel[0]))
+            x_values = x_values[-self.tare_window :]
 
-            if len(x_values) == num_values:
-                mean = np.mean(x_values)
-                std = np.std(x_values)
-                if std < 0.05:
-                    ok = True
+            if len(x_values) == self.tare_window:
+                mean = float(np.mean(x_values))
+                std = float(np.std(x_values))
+                if std < self.tare_std_threshold:
                     self.x_offset = mean
-                    print("Tare x done")
-                else:
-                    print(std)
+                    print(f"Tare x done (offset={self.x_offset:.4f})")
+                    return
 
+            attempts += 1
             time.sleep(0.01)
+
+        if x_values:
+            self.x_offset = float(np.mean(x_values))
+            print(
+                "Tare x timeout, using average offset",
+                f"({self.x_offset:.4f})",
+            )
+        else:
+            print("Tare x failed, keeping offset at 0.0")
+
+    def _tuple_valid(self, values):
+        if values is None:
+            return False
+        try:
+            return not any(v is None for v in values)
+        except TypeError:
+            return False
 
     def imu_worker(self):
         while True:
             s = time.time()
             try:
-                gyro = np.array(self.imu.gyro).copy()
-                accelero = np.array(self.imu.acceleration).copy()
+                raw_gyro = self.imu.gyro
+                raw_accel = self.imu.acceleration
             except Exception as e:
                 print("[IMU]:", e)
                 continue
 
-            if gyro is None or accelero is None:
+            if not self._tuple_valid(raw_gyro) or not self._tuple_valid(raw_accel):
+                time.sleep(0.005)
                 continue
 
-            if gyro.any() is None or accelero.any() is None:
-                continue
+            gyro = np.array(raw_gyro, dtype=float)
+            accelero = np.array(raw_accel, dtype=float)
 
             accelero[0] -= self.x_offset
 

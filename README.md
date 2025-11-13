@@ -116,6 +116,23 @@ git checkout v2
 pip install -e .
 ```
 
+## ROS 2 Humble bring-up branch
+
+To keep the existing Python runtime intact while experimenting with ROS 2, a
+dedicated branch named `ros2_humble_pkg` now hosts the ROS 2 package and launch
+assets. Switch to that branch to access the `duck_walk_bringup` package:
+
+```bash
+git checkout ros2_humble_pkg
+colcon build --packages-select duck_walk_bringup
+source install/setup.bash
+ros2 launch duck_walk_bringup walk.launch.py
+```
+
+Running the launch file mirrors the original `scripts/walk_test.py` behaviour
+but exposes all parameters through ROS 2 launch arguments so it can be chained
+with other ROS 2 nodes.
+
 In Raspberry Pi 5, you need to perform the following operations
 
 ```bash

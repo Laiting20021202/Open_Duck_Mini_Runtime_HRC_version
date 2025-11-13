@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>duck_walk_bringup</name>
+  <version>0.1.0</version>
+  <description>ROS 2 Humble launch integration for the walk_test.py runtime.</description>
+  <maintainer email="maintainer@example.com">Open Duck Maintainer</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>python3</exec_depend>
+</package>

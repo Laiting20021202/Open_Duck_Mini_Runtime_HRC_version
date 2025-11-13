@@ -140,6 +140,56 @@ pip uninstall -y RPi.GPIO
 pip install lgpio
 ```
 
+## Docker workspace (ROS 2 + Python runtime)
+
+If you prefer to avoid installing ROS 2 Humble and the Python runtime on the
+host machine, you can build a Docker image that already contains both the
+`mini_bdx_runtime` package and the `duck_walk_bringup` ROS 2 launch file. The
+image is based on `ros:humble-ros-base`, so it behaves the same as a native ROS
+2 shell once started.
+
+### Build the image
+
+```bash
+docker build -t duck-mini-runtime:humble .
+```
+
+The build stage installs all Python dependencies, registers the
+`mini_bdx_runtime` package in editable mode, and runs `colcon build` for the
+`duck_walk_bringup` ROS 2 package, so the container is ready to launch as soon
+as it starts.
+
+### Run the container
+
+```bash
+docker run --rm -it \
+    --net=host \
+    --privileged \
+    --device /dev/i2c-1 \
+    --device /dev/ttyUSB0 \
+    duck-mini-runtime:humble
+```
+
+* Use `--net=host` if you need ROS 2 DDS discovery with other machines.
+* Add `--device` (or `-v`) flags for any hardware you want to expose
+  (controllers, IMU, speaker amp, etc.). The example above exposes the default
+  I²C bus and a USB serial adapter.
+* Mount a local folder if you want to keep logs or configuration outside the
+  container, e.g. `-v $(pwd)/data:/data`.
+
+Once inside the shell the ROS 2 environment is sourced automatically, so you
+can run the walk test via launch:
+
+```bash
+ros2 launch duck_walk_bringup walk.launch.py
+```
+
+or execute the legacy Python script directly:
+
+```bash
+python3 scripts/walk_test.py
+```
+
 
 ## Test the IMU
 

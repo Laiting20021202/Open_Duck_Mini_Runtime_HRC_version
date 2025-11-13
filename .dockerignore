@@ -1,0 +1,13 @@
+.git
+**/__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info
+build
+install
+log
+logs
+.colcon*
+ros2_ws

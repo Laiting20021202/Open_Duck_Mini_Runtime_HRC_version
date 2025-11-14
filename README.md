@@ -1,182 +1,122 @@
-# Open Duck Mini Runtime
+# Duck Walk ROS 2 bring-up
 
-## Raspberry Pi zero 2W setup
+This branch exposes the legacy `scripts/walk_test.py` runtime as a ROS 2 Humble
+package named `duck_walk_bringup`. Launching
 
-### Install Raspberry Pi OS
+```
+ros2 launch duck_walk_bringup walk.launch.py
+```
 
-Download Raspberry Pi OS Lite (64-bit) from here : https://www.raspberrypi.com/software/operating-systems/
+is equivalent to running the original script, but now it can be chained with
+other ROS 2 nodes, configured via launch arguments, and started from tooling
+such as `ros2 launch`, `ros2 run`, or Docker.
 
-Follow the instructions here to install the OS on the SD card : https://www.raspberrypi.com/documentation/computers/getting-started.html
+## Repository layout
 
-With the Raspberry Pi Imager, you can pre-configure session, wifi and ssh. Do it like below :
+| Path | Purpose |
+|------|---------|
+| `duck_walk_bringup/` | ROS 2 package that exposes the walk test through launch. |
+| `scripts/walk_test.py` | Original Python entry point that talks to the robot hardware. |
+| `mini_bdx_runtime/` | Supporting Python modules reused by the entry point. |
+| `Dockerfile` | Optional container image that ships ROS 2 Humble and the package pre-built. |
 
-![imager_setup](https://github.com/user-attachments/assets/7a4987b2-de83-41dd-ab7f-585259685f16)
+## Desktop / development host workflow
 
-> Tip: I configure the rasp to connect to my phone's hotspot, this way I can connect to it from anywhere.
+1. Install Ubuntu 22.04 with the ROS 2 Humble repositories enabled, then install
+   the base dependencies:
+   ```bash
+   sudo apt update && sudo apt install \
+       ros-humble-ros-base \
+       python3-colcon-common-extensions \
+       python3-argcomplete \
+       python3-pip \
+       git
+   ```
+2. Clone this branch and install the Python pieces in editable mode so the ROS 2
+   package can import them:
+   ```bash
+   git clone https://github.com/apirrone/Open_Duck_Mini_Runtime.git
+   cd Open_Duck_Mini_Runtime
+   git checkout ros2_humble_pkg
+   pip install -e .
+   ```
+3. Build the ROS 2 package and source the workspace:
+   ```bash
+   source /opt/ros/humble/setup.bash
+   colcon build --packages-select duck_walk_bringup
+   source install/setup.bash
+   ```
+4. Launch the bring-up:
+   ```bash
+   ros2 launch duck_walk_bringup walk.launch.py \
+       use_fake_controller:=false \
+       config:=example_config.json
+   ```
+   All parameters exposed by `walk_test.py` are available as launch arguments,
+   so you can override serial devices, config files, or controller options
+   directly from the command line.
 
-### Setup SSH (If not setup during the installation)
+## Raspberry Pi Zero 2 W workflow
 
-When first booting on the rasp, you will need to connect a screen and a keyboard. The first thing you should do is connect to a wifi network and enable SSH.
+The Pi Zero 2 W can run the same ROS 2 package as long as it uses a 64-bit OS
+with Humble binaries (Ubuntu Server 22.04 is the easiest option). After flashing
+and booting the board:
 
-To do so, you can follow this guide : https://www.raspberrypi.com/documentation/computers/configuration.html#setting-up-wifi
+1. Configure networking/SSH, then install ROS 2 Humble and build tools:
+   ```bash
+   sudo apt update && sudo apt install \
+       ros-humble-ros-base \
+       python3-colcon-common-extensions \
+       python3-argcomplete \
+       python3-pip \
+       git
+   echo "source /opt/ros/humble/setup.bash" >> ~/.bashrc
+   ```
+2. Make sure the `pi` (or your user) account can access the hardware that the
+   walk test expects:
+   ```bash
+   sudo usermod -a -G dialout,i2c $USER
+   sudo raspi-config nonint do_i2c 0
+   sudo udevadm control --reload
+   ```
+   Log out/in so the new group membership takes effect, then connect the FTDI
+   adapter, IMU, servos, and controller as usual.
+3. Clone the repository, install the Python runtime, and build the ROS 2 package:
+   ```bash
+   git clone https://github.com/apirrone/Open_Duck_Mini_Runtime.git
+   cd Open_Duck_Mini_Runtime
+   git checkout ros2_humble_pkg
+   pip install -e .
+   colcon build --packages-select duck_walk_bringup
+   source install/setup.bash
+   ```
+4. Run the launch file just like on the desktop:
+   ```bash
+   ros2 launch duck_walk_bringup walk.launch.py \
+       config:=example_config.json \
+       motor_port:=/dev/ttyUSB0 \
+       controller_name:=xbox
+   ```
+   Use `use_fake_controller:=true` if you need to validate the robot without a
+   paired gamepad, or override any other launch argument to point to different
+   hardware paths.
 
-Then, you can connect to your rasp using SSH without having to plug a screen and a keyboard.
+## Optional Docker workflow
 
-### Update the system and install necessary stuff
+If you prefer not to install ROS 2 on the host, build the provided image and
+run the launch file inside the container:
 
 ```bash
-sudo apt update
-sudo apt upgrade
-sudo apt install git
-sudo apt install python3-pip
-sudo apt install python3-virtualenvwrapper
-(optional) sudo apt install python3-picamzero
-
+docker build -t duck-mini-runtime:humble .
+docker run --rm -it \
+    --net=host \
+    --privileged \
+    --device /dev/i2c-1 \
+    --device /dev/ttyUSB0 \
+    duck-mini-runtime:humble
 ```
 
-Add this to the end of the `.bashrc`:
-
-```bash
-export WORKON_HOME=$HOME/.virtualenvs
-export PROJECT_HOME=$HOME/Devel
-source /usr/share/virtualenvwrapper/virtualenvwrapper.sh
-```
-
-### Enable I2C
-
-`sudo raspi-config` -> `Interface Options` -> `I2C`
-
-TODO set 400KHz ?
-
-### Set the usbserial latency timer
-
-```bash
-cd  /etc/udev/rules.d/
-sudo touch 99-usb-serial.rules
-sudo nano 99-usb-serial.rules
-# copy the following line in the file
-SUBSYSTEM=="usb-serial", DRIVER=="ftdi_sio", ATTR{latency_timer}="1"
-```
-
-### Set the udev rules for the motor control board
-
-TODO
-
-
-### Setup xbox one controller over bluetooth
-
-Turn your xbox one controller on and set it in pairing mode by long pressing the sync button on the top of the controller.
-
-Run the following commands on the rasp :
-
-```bash
-bluetoothctl
-scan on
-```
-
-Wait for the controller to appear in the list, then run :
-
-```bash
-pair <controller_mac_address>
-trust <controller_mac_address>
-connect <controller_mac_address>
-```
-
-The led on the controller should stop blinking and stay on.
-
-You can test that it's working by running
-
-```bash
-python3 mini_bdx_runtime/mini_bdx_runtime/xbox_controller.py
-```
-
-## Speaker wiring and configuration
-Follow this tutorial
-
-> For now, don't activate `/dev/zero` when they ask
-
-https://learn.adafruit.com/adafruit-max98357-i2s-class-d-mono-amp?view=all
-
-
-## Install the runtime
-
-### Make a virtual environment and activate it
-
-```bash
-mkvirtualenv -p python3 open-duck-mini-runtime
-workon open-duck-mini-runtime
-```
-
-Clone this repository on your rasp, cd into the repo, then :
-
-```bash
-git clone https://github.com/apirrone/Open_Duck_Mini_Runtime
-cd Open_Duck_Mini_Runtime
-git checkout v2
-pip install -e .
-```
-
-In Raspberry Pi 5, you need to perform the following operations
-
-```bash
-pip uninstall -y RPi.GPIO
-pip install lgpio
-```
-
-
-## Test the IMU
-
-```bash
-python3 mini_bdx_runtime/mini_bdx_runtime/raw_imu.py
-```
-
-You can also run `python3 scripts/imu_server.py` on the robot and `python3 scripts/imu_client.py --ip <robot_ip>` on your computer to check that the frame is oriented correctly. 
-
-> To find the ip address of the robot, run `ifconfig` on the robot
-
-## Test motors
-
-This will allow you to verify all your motors are connected and configured.
-
-```bash
-python3 scripts/check_motors.py
-```
-
-## Make your duck_config.json
-
-Copy `example_config.json` in the home directory of your duck and rename it `duck_config.json`.
-
-`cp example_config.json ~/duck_config.json`
-
-In this file, you can configure some stuff, like registering if you installed the expression features, installed the imu upside down or and other stuff. You also write the joints offsets of your duck here
-
-## Find the joints offsets
-
-This script will guide you through finding the joints offsets of your robot that you can then write in your `duck_config.json`
-
-> This procedure won't be necessary in the future as we will be flashing the offsets directly in each motor's eeprom.
-
-```bash
-cd scripts/
-python find_soft_offsets.py
-```
-
-## Run the walk !
-
-Download the [latest policy checkpoint ](https://github.com/apirrone/Open_Duck_Mini/blob/v2/BEST_WALK_ONNX_2.onnx) and copy it to your duck.
-
-`cd scripts/`
-
-`python v2_rl_walk_mujoco.py --onnx_model_path <path_to>/BEST_WALK_ONNX_2.onnx`
-
-
-
-```
-- The commands are : 
-- A to pause/unpause
-- X to turn on/off the projector
-- B to play a random sound
-- Y to turn on/off head control (very experimental, I don't recommend trying that, it can break your duck's head)
-- left and right triggers to control the left and right antennas
-- LB (new!) press and hold to increase the walking frequency, kind of a sprint mode 🙂
-```
+The container automatically sources both `/opt/ros/humble` and the local
+workspace, so you can immediately execute `ros2 launch duck_walk_bringup
+walk.launch.py` after attaching to the shell. Add or remove `--device` flags to
+match the hardware connected to your machine.

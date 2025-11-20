@@ -52,9 +52,9 @@ class HWI:
         self.init_pos = {
             "left_hip_yaw": 0.002,
             "left_hip_roll": 0.053,
-            "left_hip_pitch": -0.63,
-            "left_knee": 1.368,
-            "left_ankle": -0.784,
+            "left_hip_pitch": -0.55,
+            "left_knee": 1.22,
+            "left_ankle": -0.68,
             "neck_pitch": 0.0,
             "head_pitch": 0.0,
             "head_yaw": 0,
@@ -63,9 +63,9 @@ class HWI:
             # "right_antenna": 0,
             "right_hip_yaw": -0.003,
             "right_hip_roll": -0.065,
-            "right_hip_pitch": 0.635,
-            "right_knee": 1.379,
-            "right_ankle": -0.796,
+            "right_hip_pitch": 0.55,
+            "right_knee": 1.22,
+            "right_ankle": -0.68,
         }
 
         self.joints_offsets = self.duck_config.joints_offset

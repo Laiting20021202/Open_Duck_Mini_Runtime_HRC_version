@@ -81,3 +81,8 @@ class DuckConfig:
                 "right_ankle": 0.0,
             },
         )
+
+        # optional overrides for the hardware interface's initial pose
+        # (see rustypot_position_hwi.HWI.init_pos). Keys should match joint
+        # names.
+        self.init_pos_overrides = self.json_config.get("init_pos_overrides", {})

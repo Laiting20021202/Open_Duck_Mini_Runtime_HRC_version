@@ -130,9 +130,30 @@ pip install lgpio
 python3 mini_bdx_runtime/mini_bdx_runtime/raw_imu.py
 ```
 
-You can also run `python3 scripts/imu_server.py` on the robot and `python3 scripts/imu_client.py --ip <robot_ip>` on your computer to check that the frame is oriented correctly. 
+You can also run `python3 scripts/imu_server.py` on the robot and `python3 scripts/imu_client.py --ip <robot_ip>` on your computer to check that the frame is oriented correctly.
 
 > To find the ip address of the robot, run `ifconfig` on the robot
+
+### How to test the new IMU pitch-bias alignment
+- **Hardware walk test (recommended):**
+  ```bash
+  python3 scripts/walk_test.py \
+    --onnx_model_path /path/to/BEST_WALK_ONNX_2.onnx \
+    --pitch_bias 4.0 \
+    --imu_auto_pitch_samples 200
+  ```
+  - Adjust `--pitch_bias` (degrees) if your IMU is mounted with a forward tilt; positive values tilt the sensor backward.
+  - The script will log any auto-estimated pitch correction and the accelerometer X-axis tare offset before walking starts.
+
+- **MuJoCo sanity check (no hardware needed):**
+  ```bash
+  python3 scripts/v2_rl_walk_mujoco.py \
+    --pitch_bias 4.0 \
+    --imu_auto_pitch_samples 200
+  ```
+  - This exercises the same rotation/tare pipeline using simulated IMU data so you can verify the math and logging flow.
+
+- **Baseline comparison:** Add `--disable_imu_auto_pitch_bias` to either command to skip gravity-based pitch estimation and compare with the previous behavior.
 
 ## Test motors
 
@@ -165,18 +186,15 @@ python find_soft_offsets.py
 
 Download the [latest policy checkpoint ](https://github.com/apirrone/Open_Duck_Mini/blob/v2/BEST_WALK_ONNX_2.onnx) and copy it to your duck.
 
-`cd scripts/`
-
-`python v2_rl_walk_mujoco.py --onnx_model_path <path_to>/BEST_WALK_ONNX_2.onnx`
-
-
-
 ```
-- The commands are : 
+cd scripts/
+python v2_rl_walk_mujoco.py --onnx_model_path <path_to>/BEST_WALK_ONNX_2.onnx
+```
+
+The commands are:
 - A to pause/unpause
 - X to turn on/off the projector
 - B to play a random sound
-- Y to turn on/off head control (very experimental, I don't recommend trying that, it can break your duck's head)
+- Y to turn on/off head control (very experimental, I don't recommend trying that; it can break your duck's head)
 - left and right triggers to control the left and right antennas
 - LB (new!) press and hold to increase the walking frequency, kind of a sprint mode 🙂
-```

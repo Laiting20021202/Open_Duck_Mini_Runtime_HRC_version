@@ -21,12 +21,24 @@ class Imu:
         auto_tare=True,
         tare_window=120,
         tare_std_threshold=0.05,
+        auto_pitch_bias=True,
+        auto_pitch_samples=120,
     ):
         self.sampling_freq = sampling_freq
         self.calibrate = calibrate
         self.auto_tare = auto_tare
         self.tare_window = tare_window
         self.tare_std_threshold = tare_std_threshold
+        self.auto_pitch_bias = auto_pitch_bias
+        self.auto_pitch_samples = auto_pitch_samples
+        self._last_error_log = 0.0
+
+        # Allow compensating for a mechanically mis-mounted IMU by rotating the
+        # raw measurements around the pitch (Y) axis. The CLI exposes this as
+        # --pitch_bias (degrees) in walk_test.py.
+        self._pitch_bias_rad = (
+            np.deg2rad(float(user_pitch_bias)) if user_pitch_bias else 0.0
+        )
 
         i2c = busio.I2C(board.SCL, board.SDA)
         self.imu = adafruit_bno055.BNO055_I2C(i2c)
@@ -98,6 +110,9 @@ class Imu:
 
         self.x_offset = 0.0
 
+        if self.auto_pitch_bias:
+            self._maybe_auto_pitch_bias()
+
         if self.auto_tare:
             self.tare_x()
 
@@ -115,13 +130,16 @@ class Imu:
         attempts = 0
         max_attempts = max(self.tare_window * 20, 200)
         while attempts < max_attempts:
-            raw_accel = self.imu.acceleration
+            raw_accel = self._read_accel()
             if not self._tuple_valid(raw_accel):
                 attempts += 1
                 time.sleep(0.01)
                 continue
 
-            x_values.append(float(raw_accel[0]))
+            accel = np.array(raw_accel, dtype=float)
+            accel = self._apply_pitch_bias(accel)
+
+            x_values.append(float(accel[0]))
             x_values = x_values[-self.tare_window :]
 
             if len(x_values) == self.tare_window:
@@ -152,15 +170,71 @@ class Imu:
         except TypeError:
             return False
 
+    def _read_accel(self):
+        try:
+            return self.imu.acceleration
+        except Exception as e:
+            self._log_imu_error(e)
+            return None
+
+    def _read_gyro(self):
+        try:
+            return self.imu.gyro
+        except Exception as e:
+            self._log_imu_error(e)
+            return None
+
+    def _log_imu_error(self, exc):
+        now = time.time()
+        # Avoid spamming the console with I2C errors; throttle to 2 Hz.
+        if now - self._last_error_log > 0.5:
+            print("[IMU]:", exc)
+            self._last_error_log = now
+
+    def _apply_pitch_bias(self, vec):
+        if self._pitch_bias_rad == 0.0:
+            return vec
+
+        c = np.cos(-self._pitch_bias_rad)
+        s = np.sin(-self._pitch_bias_rad)
+        x, y, z = vec
+
+        return np.array([c * x + s * z, y, -s * x + c * z], dtype=float)
+
+    def _maybe_auto_pitch_bias(self):
+        samples = []
+        attempts = 0
+        max_attempts = max(self.auto_pitch_samples * 3, 120)
+
+        while len(samples) < self.auto_pitch_samples and attempts < max_attempts:
+            raw_accel = self._read_accel()
+            if self._tuple_valid(raw_accel):
+                samples.append(np.array(raw_accel, dtype=float))
+            attempts += 1
+            time.sleep(0.01)
+
+        if not samples:
+            print("Auto pitch bias skipped (no valid accel samples)")
+            return
+
+        mean_accel = np.mean(np.vstack(samples), axis=0)
+        pitch_error = -float(np.arctan2(mean_accel[0], mean_accel[2]))
+
+        if abs(pitch_error) < 1e-6:
+            return
+
+        self._pitch_bias_rad += pitch_error
+        print(
+            "Auto pitch bias applied:",
+            f"{np.rad2deg(pitch_error):.2f} deg",
+            f"(total={np.rad2deg(self._pitch_bias_rad):.2f} deg)",
+        )
+
     def imu_worker(self):
         while True:
             s = time.time()
-            try:
-                raw_gyro = self.imu.gyro
-                raw_accel = self.imu.acceleration
-            except Exception as e:
-                print("[IMU]:", e)
-                continue
+            raw_gyro = self._read_gyro()
+            raw_accel = self._read_accel()
 
             if not self._tuple_valid(raw_gyro) or not self._tuple_valid(raw_accel):
                 time.sleep(0.005)
@@ -168,6 +242,9 @@ class Imu:
 
             gyro = np.array(raw_gyro, dtype=float)
             accelero = np.array(raw_accel, dtype=float)
+
+            gyro = self._apply_pitch_bias(gyro)
+            accelero = self._apply_pitch_bias(accelero)
 
             accelero[0] -= self.x_offset
 

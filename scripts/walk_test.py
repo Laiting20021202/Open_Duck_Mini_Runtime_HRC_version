@@ -259,6 +259,8 @@ class RLWalk:
         imu_auto_tare=True,
         imu_tare_window=120,
         imu_tare_std_threshold=0.05,
+        imu_auto_pitch_bias=True,
+        imu_auto_pitch_samples=120,
     ):
         self.duck_config = DuckConfig(config_json_path=duck_config_path)
 
@@ -308,6 +310,8 @@ class RLWalk:
             auto_tare=imu_auto_tare,
             tare_window=imu_tare_window,
             tare_std_threshold=imu_tare_std_threshold,
+            auto_pitch_bias=imu_auto_pitch_bias,
+            auto_pitch_samples=imu_auto_pitch_samples,
         )
 
         self.feet_contacts = FeetContacts()
@@ -660,6 +664,17 @@ if __name__ == "__main__":
         default=0.05,
         help="Std-dev threshold (m/s^2) for accepting IMU tare measurements.",
     )
+    parser.add_argument(
+        "--disable_imu_auto_pitch_bias",
+        action="store_true",
+        help="Skip automatic IMU pitch bias estimation from gravity.",
+    )
+    parser.add_argument(
+        "--imu_auto_pitch_samples",
+        type=int,
+        default=120,
+        help="Samples used to estimate the IMU pitch bias from gravity.",
+    )
 
     args = parser.parse_args()
     pid = [args.p, args.i, args.d]
@@ -681,6 +696,8 @@ if __name__ == "__main__":
         imu_auto_tare=not args.disable_imu_auto_tare,
         imu_tare_window=args.imu_tare_window,
         imu_tare_std_threshold=args.imu_tare_std_threshold,
+        imu_auto_pitch_bias=not args.disable_imu_auto_pitch_bias,
+        imu_auto_pitch_samples=args.imu_auto_pitch_samples,
     )
     print("Done instantiating RLWalk")
     rl_walk.run()

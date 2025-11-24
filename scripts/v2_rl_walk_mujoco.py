@@ -35,6 +35,8 @@ class RLWalk:
         save_obs=False,
         replay_obs=None,
         cutoff_frequency=None,
+        imu_auto_pitch_bias=True,
+        imu_auto_pitch_samples=120,
     ):
 
         self.duck_config = DuckConfig(config_json_path=duck_config_path)
@@ -74,6 +76,8 @@ class RLWalk:
             sampling_freq=int(self.control_freq),
             user_pitch_bias=self.pitch_bias,
             upside_down=self.duck_config.imu_upside_down,
+            auto_pitch_bias=imu_auto_pitch_bias,
+            auto_pitch_samples=imu_auto_pitch_samples,
         )
 
         self.feet_contacts = FeetContacts()
@@ -379,6 +383,17 @@ if __name__ == "__main__":
         help="replay the observations from a previous run (can be from the robot or from mujoco)",
     )
     parser.add_argument("--cutoff_frequency", type=float, default=None)
+    parser.add_argument(
+        "--disable_imu_auto_pitch_bias",
+        action="store_true",
+        help="Skip automatic IMU pitch bias estimation from gravity.",
+    )
+    parser.add_argument(
+        "--imu_auto_pitch_samples",
+        type=int,
+        default=120,
+        help="Samples used to estimate the IMU pitch bias from gravity.",
+    )
 
     args = parser.parse_args()
     pid = [args.p, args.i, args.d]
@@ -395,6 +410,8 @@ if __name__ == "__main__":
         save_obs=args.save_obs,
         replay_obs=args.replay_obs,
         cutoff_frequency=args.cutoff_frequency,
+        imu_auto_pitch_bias=not args.disable_imu_auto_pitch_bias,
+        imu_auto_pitch_samples=args.imu_auto_pitch_samples,
     )
     print("Done instantiating RLWalk")
     rl_walk.run()

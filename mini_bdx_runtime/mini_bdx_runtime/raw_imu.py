@@ -28,6 +28,11 @@ class Imu:
         self.tare_window = tare_window
         self.tare_std_threshold = tare_std_threshold
 
+        # Allow compensating for a mechanically mis-mounted IMU by rotating the
+        # raw measurements around the pitch (Y) axis. The CLI exposes this as
+        # --pitch_bias (degrees) in walk_test.py.
+        self._pitch_bias_rad = np.deg2rad(float(user_pitch_bias)) if user_pitch_bias else 0.0
+
         i2c = busio.I2C(board.SCL, board.SDA)
         self.imu = adafruit_bno055.BNO055_I2C(i2c)
 
@@ -121,7 +126,10 @@ class Imu:
                 time.sleep(0.01)
                 continue
 
-            x_values.append(float(raw_accel[0]))
+            accel = np.array(raw_accel, dtype=float)
+            accel = self._apply_pitch_bias(accel)
+
+            x_values.append(float(accel[0]))
             x_values = x_values[-self.tare_window :]
 
             if len(x_values) == self.tare_window:
@@ -152,6 +160,16 @@ class Imu:
         except TypeError:
             return False
 
+    def _apply_pitch_bias(self, vec):
+        if self._pitch_bias_rad == 0.0:
+            return vec
+
+        c = np.cos(-self._pitch_bias_rad)
+        s = np.sin(-self._pitch_bias_rad)
+        x, y, z = vec
+
+        return np.array([c * x + s * z, y, -s * x + c * z], dtype=float)
+
     def imu_worker(self):
         while True:
             s = time.time()
@@ -168,6 +186,9 @@ class Imu:
 
             gyro = np.array(raw_gyro, dtype=float)
             accelero = np.array(raw_accel, dtype=float)
+
+            gyro = self._apply_pitch_bias(gyro)
+            accelero = self._apply_pitch_bias(accelero)
 
             accelero[0] -= self.x_offset
 

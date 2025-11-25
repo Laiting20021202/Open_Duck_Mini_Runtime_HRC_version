@@ -49,7 +49,7 @@ class HWI:
             "right_ankle": 0,
         }
 
-        self.init_pos = {
+        default_init_pos = {
             "left_hip_yaw": 0.002,
             "left_hip_roll": 0.053,
             "left_hip_pitch": -0.63,
@@ -67,6 +67,8 @@ class HWI:
             "right_knee": 1.379,
             "right_ankle": -0.796,
         }
+
+        self.init_pos = {**default_init_pos, **self.duck_config.init_pos_overrides}
 
         self.joints_offsets = self.duck_config.joints_offset
 
